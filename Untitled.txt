@@ -1,0 +1,199 @@
+clc;clear;close all;
+vidDevice = imaq.VideoDevice(...
+                             'winvideo', 1, 'YUY2_640x480', ...
+                             'ROI', [1 1 640 480], ...
+                             'ReturnedColorSpace', 'rgb', ...
+                             'DeviceProperties.Brightness', 5, ...
+                             'DeviceProperties.Sharpness', 5);
+hVideoIn = vision.VideoPlayer;
+hVideoIn.Name='Input Video'
+hVideoOut = vision.VideoPlayer;
+hVideoOut.Name='Output Video';
+faceDetector = vision.CascadeObjectDetector();
+pointTracker = vision.PointTracker('MaxBidirectionalError', 2);
+numPts = 0;
+nFrames = 0;
+
+[zxpointx,zxpointy] = size([1,2]);
+cccx = 320; cccy = 240; %Camera center coordinates x,y
+size_benchmack = 80; %识别人头大小 x运动基准
+queue_index = 0;
+
+%load DobotDll
+if ~libisloaded('DobotDll')
+   [notfound, warnings]=loadlibrary('DobotDll.dll','DobotDll.h');
+end
+%libfunctionsview DobotDll
+
+%create size 128 charArrays
+ch=blanks(128);
+
+%create pointer piont to charArrays
+str1= libpointer('cstring',ch);
+
+%search the magician device   res1:device number     res2:device address
+[res1,res2]=calllib('DobotDll','SearchDobot',str1,128);
+
+%create pointer piont to device address
+str2= libpointer('cstring',res2);
+%contect device res3:contect result 0:success 1:error 2:timeout
+[res3,res4]=calllib('DobotDll','ConnectDobot',str2, 115200);
+
+
+% while (nFrames<20000)
+for i=1:200
+    videoFrame = step(vidDevice);
+    videoFrameOutput = videoFrame;
+    videoFrameGray = rgb2gray(videoFrame);
+    if numPts < 10
+        % Detection mode.
+        bbox = faceDetector.step(videoFrameGray);
+        if ~isempty(bbox)
+            % Find corner points inside the detected region.
+            points = detectMinEigenFeatures(videoFrameGray, 'ROI', bbox(1, :));
+            % Re-initialize the point tracker.
+            xyPoints = points.Location;
+            numPts = size(xyPoints,1);
+            release(pointTracker);
+            initialize(pointTracker, xyPoints, videoFrameGray);
+            % Save a copy of the points.
+            oldPoints = xyPoints;
+            % Convert the rectangle represented as [x, y, w, h] into an
+            % M-by-2 matrix of [x,y] coordinates of the four corners. This
+            % is needed to be able to transform the bounding box to display
+            % the orientation of the face.
+            bboxPoints = bbox2points(bbox(1, :));
+            % Convert the box corners into the [x1 y1 x2 y2 x3 y3 x4 y4]
+            % format required by insertShape.
+            bboxPolygon = reshape(bboxPoints', 1, []);
+            % Display a bounding box around the detected face.
+            videoFrameOutput = insertShape(videoFrameOutput, 'Polygon', bboxPolygon, 'LineWidth', 3);
+            % Display detected corners.
+            videoFrameOutput = insertMarker(videoFrameOutput, xyPoints, '+', 'Color', 'white');
+        end
+    else
+        % Tracking mode.
+        [xyPoints, isFound] = step(pointTracker, videoFrameGray);
+        visiblePoints = xyPoints(isFound, :);
+        oldInliers = oldPoints(isFound, :);
+        numPts = size(visiblePoints, 1);
+        if numPts >= 10
+            % Estimate the geometric transformation between the old points
+            % and the new points.
+            [xform, oldInliers, visiblePoints] = estimateGeometricTransform(...
+                oldInliers, visiblePoints, 'similarity', 'MaxDistance', 4);
+            % Apply the transformation to the bounding box.
+            bboxPoints = transformPointsForward(xform, bboxPoints);
+            % Convert the box corners into the [x1 y1 x2 y2 x3 y3 x4 y4]
+            % format required by insertShape.
+            bboxPolygon = reshape(bboxPoints', 1, []);
+            % Display a bounding box around the face being tracked.
+            videoFrameOutput = insertShape(videoFrameOutput, 'Polygon', bboxPolygon, 'LineWidth', 3);
+            % Display tracked points.
+            videoFrameOutput = insertMarker(videoFrameOutput, visiblePoints, '+', 'Color', 'white');
+            % Reset the points.
+            oldPoints = visiblePoints;
+            setPoints(pointTracker, oldPoints);
+        end
+    end
+ % Display video.
+    step(hVideoIn, videoFrame);
+    step(hVideoOut, videoFrameOutput);
+    nFrames = nFrames + 1;
+    
+    
+    %create queue index
+%     calllib('DoblotDll','GetQueuedCmdCurrentIndex',&queue_index);
+    
+    queue_index=1;
+    %create ptp struct
+    if (exist('bboxPolygon'))
+        ptp.ptpMode=7;
+%         [zxpointx,zxpointy]= sum(bboxPoints);
+        zxpointx = (bboxPolygon(1) + bboxPolygon(3) + bboxPolygon(5) + bboxPolygon(7))/4;
+        zxpointy = (bboxPolygon(2) + bboxPolygon(4) + bboxPolygon(6) + bboxPolygon(8))/4;
+        if (zxpointx <cccx)
+            ptp.y=20.0;
+        else
+            ptp.y=-20.0;
+        end
+        if (zxpointy <cccy)
+            ptp.z=20.0;
+        else
+            ptp.z=-20.0;
+        end
+        if (abs(zxpointx - bboxPoints(1))<size_benchmack)
+            ptp.x=20.0;
+        else
+            ptp.x=-20.0;
+        end
+
+        ptp.r=0.0;
+        
+        %cmd start exec queue
+        calllib('DobotDll','SetQueuedCmdStartExec')
+        
+        %速度加速度
+        %第四层：结构体内部定义
+        %有一定差 速度调快，差较大调快加速度
+        if ((abs(zxpointx-cccx)>0.3*cccx)||(abs(zxpointy-cccy)>0.3*cccy)||(abs((zxpointx - bboxPoints(1))-size_benchmack)>0.3*size_benchmack))
+            if ((abs(zxpointx-cccx)>0.5*cccx)||(abs(zxpointy-cccy)>0.5*cccy)||(abs((zxpointx - bboxPoints(1))-size_benchmack)>0.5*size_benchmack))
+                ptpCP.accelerationRatio = 90;
+            end
+            ptpCP.velocityRatio = 60;
+           
+        else
+            ptpCP.velocityRatio = 30;
+            ptpCP.accelerationRatio = 20;
+        end
+        %第三层：结构体
+        ptpCommonParams=libstruct('tagPTPCommonParams',ptpCP);
+        %第二层：指针
+        ptpCommonParamsptr=libpointer('tagPTPCommonParamsPtr',ptpCommonParams);
+        queuedCmdIndex=1;
+        queuedCmdIndexptr=libpointer('uint64Ptr',queuedCmdIndex);
+        %第一层：速度加速度百分比设置
+        calllib('DobotDll','SetPTPCommonParams',ptpCommonParamsptr,true,queuedCmdIndexptr);
+        
+        %cmd start exec queue
+        calllib('DobotDll','SetQueuedCmdStartExec')
+
+        %create c type struct
+        ptpstruct=libstruct('tagPTPCmd',ptp);
+
+        %create ptp pointer
+        ptpstructptr=libpointer('tagPTPCmdPtr',ptpstruct);
+        queue_index_ptr=libpointer('uint64Ptr',queue_index);
+        %send ptp cmd
+        calllib('DobotDll','SetPTPCmd',ptpstructptr,true,queue_index_ptr); 
+        pause(0.2);
+        
+    end
+    
+end
+
+%cmd stop exec queue
+calllib('DobotDll','SetQueuedCmdStopExec');
+
+%cmd disconnect device
+calllib('DobotDll','DisconnectDobot'); 
+
+%clear value
+clear ptpCP;
+clear ptpCommonParams;
+clear ptpCommonParamsptr;
+clear queuedCmdIndexptr;
+clear ptp;
+clear ptpstruct;
+clear ptpstructptr;
+clear queue_index_ptr;
+clear str1;
+clear str2;
+
+%unloadlibrary DobotDll;
+unloadlibrary('DobotDll');
+
+release(vidDevice);
+release(hVideoIn);
+release(hVideoOut);
+close all force;
